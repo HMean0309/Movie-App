@@ -1,0 +1,234 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ==================== ENUMS ====================
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+}
+
+enum MovieType {
+  single   // Phim lẻ
+  series   // Phim bộ
+}
+
+// ==================== USERS ====================
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  fullName     String?  @map("full_name")
+  avatarUrl    String?  @map("avatar_url")
+  role         Role     @default(USER)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  authSessions   AuthSession[]
+  subscription   Subscription?
+  watchlist      Watchlist[]
+  watchHistory   WatchHistory[]
+  hostedRooms    WatchPartyRoom[]      @relation("HostedRooms")
+  partyMembers   WatchPartyMember[]
+  reviews        Review[]
+
+  @@map("users")
+}
+
+// Session đăng nhập (lưu refresh token)
+model AuthSession {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  refreshToken String   @unique @map("refresh_token")
+  deviceInfo   String?  @map("device_info")  // "Chrome/Windows"
+  ipAddress    String?  @map("ip_address")
+  expiresAt    DateTime @map("expires_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("auth_sessions")
+}
+
+// ==================== SUBSCRIPTIONS ====================
+
+model SubscriptionPlan {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String   @unique  // "FREE", "PREMIUM"
+  price        Decimal  @db.Decimal(10, 2)
+  maxStreams   Int      @default(1) @map("max_streams")
+  durationDays Int      @map("duration_days")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  subscriptions Subscription[]
+
+  @@map("subscription_plans")
+}
+
+model Subscription {
+  id        String             @id @default(uuid()) @db.Uuid
+  userId    String             @unique @map("user_id") @db.Uuid
+  planId    String             @map("plan_id") @db.Uuid
+  status    SubscriptionStatus @default(ACTIVE)
+  startedAt DateTime           @default(now()) @map("started_at")
+  expiresAt DateTime           @map("expires_at")
+
+  user User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan SubscriptionPlan @relation(fields: [planId], references: [id])
+
+  @@map("subscriptions")
+}
+
+// ==================== MOVIES ====================
+
+model Movie {
+  id          String    @id @default(uuid()) @db.Uuid
+  ophimId     String?   @unique @map("ophim_id")   // id gốc bên OPhim
+  slug        String    @unique
+  name        String
+  originName  String?   @map("origin_name")
+  type        MovieType @default(single)
+  posterUrl   String?   @map("poster_url")
+  thumbUrl    String?   @map("thumb_url")
+  description String?   @db.Text
+  status      String?                              // "completed", "ongoing"
+  year        Int?
+  categories  Json      @default("[]")             // ["Hành động", "Kinh dị"]
+  countries   Json      @default("[]")
+  actors      Json      @default("[]")             // ["Tom Hanks", "Leonardo"]
+  directors   Json      @default("[]")             // ["Christopher Nolan"]
+  time        String?                              // "24 phút/tập"
+  quality     String?                              // "HD", "FHD"
+  lang        String?                              // "Vietsub", "Thuyết Minh"
+  episodeCurrent String? @map("episode_current")   // "Tập 6"
+  episodeTotal   String? @map("episode_total")     // "24 Tập"
+  tmdbVote    Float?    @map("tmdb_vote")          // 9.0
+  imdbVote    Float?    @map("imdb_vote")          // 8.4
+  imdbVoteCount Int?    @map("imdb_vote_count")    // 1000000
+  view        Int       @default(0)                // View đếm từ API OPhim
+  tmdbPoster  String?   @map("tmdb_poster")        // Ảnh gốc doc-TMDB (nếu có)
+  tmdbBackdrop String?  @map("tmdb_backdrop")      // Ảnh ngang TMDB (nếu có)
+  syncedAt    DateTime? @map("synced_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  episodes     Episode[]
+  watchlist    Watchlist[]
+  watchHistory WatchHistory[]
+  partyRooms   WatchPartyRoom[]
+  reviews      Review[]
+
+  @@map("movies")
+}
+
+model Episode {
+  id           String   @id @default(uuid()) @db.Uuid
+  movieId      String   @map("movie_id") @db.Uuid
+  serverName   String   @map("server_name")  // "Vietsub #1"
+  episodeName  String   @map("episode_name") // "Tập 1", "Full"
+  linkM3u8     String?  @map("link_m3u8")
+  linkEmbed    String?  @map("link_embed")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  movie        Movie          @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  watchHistory WatchHistory[]
+  partyRooms   WatchPartyRoom[]
+
+  @@unique([movieId, serverName, episodeName])
+  @@map("episodes")
+}
+
+// ==================== USER ACTIVITY ====================
+
+model Watchlist {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  movieId   String   @map("movie_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  movie Movie @relation(fields: [movieId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, movieId])  // Không thêm trùng
+  @@map("watchlist")
+}
+
+model WatchHistory {
+  id              String   @id @default(uuid()) @db.Uuid
+  userId          String   @map("user_id") @db.Uuid
+  movieId         String   @map("movie_id") @db.Uuid
+  episodeId       String?  @map("episode_id") @db.Uuid
+  progressSeconds Int      @default(0) @map("progress_seconds")
+  watchedAt       DateTime @default(now()) @map("watched_at")
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  movie   Movie    @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  episode Episode? @relation(fields: [episodeId], references: [id])
+
+  @@map("watch_history")
+}
+
+// ==================== WATCH PARTY ====================
+
+model WatchPartyRoom {
+  id          String   @id @default(uuid()) @db.Uuid
+  hostUserId  String   @map("host_user_id") @db.Uuid
+  movieId     String   @map("movie_id") @db.Uuid
+  episodeId   String?  @map("episode_id") @db.Uuid
+  inviteCode  String   @unique @map("invite_code")
+  currentTime Int      @default(0) @map("current_time")
+  isPlaying   Boolean  @default(false) @map("is_playing")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  host    User              @relation("HostedRooms", fields: [hostUserId], references: [id])
+  movie   Movie             @relation(fields: [movieId], references: [id])
+  episode Episode?          @relation(fields: [episodeId], references: [id])
+  members WatchPartyMember[]
+
+  @@map("watch_party_rooms")
+}
+
+model WatchPartyMember {
+  id       String   @id @default(uuid()) @db.Uuid
+  roomId   String   @map("room_id") @db.Uuid
+  userId   String   @map("user_id") @db.Uuid
+  joinedAt DateTime @default(now()) @map("joined_at")
+
+  room WatchPartyRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([roomId, userId])
+  @@map("watch_party_members")
+}
+
+// ==================== REVIEWS ====================
+
+model Review {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  movieId   String   @map("movie_id") @db.Uuid
+  rating    Int      @default(5)
+  comment   String   @db.Text
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  movie Movie @relation(fields: [movieId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, movieId])
+  @@map("reviews")
+}
