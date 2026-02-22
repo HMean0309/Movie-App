@@ -5,7 +5,7 @@ services:
     plan: free
     rootDir: backend
     buildCommand: npm install && npx prisma generate && npm run build
-    startCommand: npm run db:push && npm run start
+    startCommand: DATABASE_URL=$DIRECT_URL npm run db:push --accept-data-loss && npm run start
     envVars:
       - key: PORT
         value: 3001
