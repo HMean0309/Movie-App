@@ -1,36 +1,42 @@
 /**
- * 🎬 CRAWL TOÀN BỘ PHIM TỪ OPHIM API
- * ─────────────────────────────────────
- * Chạy: npx tsx crawl-all.ts
- * 
- * - Phân trang qua /v1/api/danh-sach/phim-moi-cap-nhat
- * - Lấy chi tiết + episodes cho mỗi phim
- * - Upsert vào PostgreSQL qua Prisma
- * - Có retry, rate limit, progress log
- * - Có thể resume nếu bị ngắt (skip phim đã có trong DB)
+ * CRAWL TOAN BO PHIM TU OPHIM API
+ * Chay: node -e "const env = require('dotenv').config().parsed; require('child_process').execSync('npx tsx crawl-all.ts', {stdio: 'inherit', env: { ...process.env, DATABASE_URL: env.DIRECT_URL }})"
+ *
+ * Toi uu:
+ * - Movie: raw SQL ON CONFLICT (1 round-trip)
+ * - Episodes: deleteMany + bulk INSERT (2 round-trips thay vi N*2)
+ * - 8 phim song song (Promise.allSettled)
+ * - Co the resume bang cach sua START_PAGE
  */
 import 'dotenv/config';
 import { prisma } from './src/lib/prisma';
 
 const OPHIM_API = process.env.OPHIM_API_URL || 'https://ophim1.com';
 const CDN = 'https://img.ophim.cc/uploads/movies/';
-const DELAY_MS = 200;        // Delay giữa mỗi request chi tiết
-const PAGE_DELAY_MS = 500;   // Delay giữa mỗi trang
-const MAX_RETRIES = 3;       // Retry tối đa khi lỗi
-const START_PAGE = 1;        // Trang bắt đầu (điều chỉnh nếu muốn resume)
+const DELAY_MS = 50;         // Delay giua moi batch
+const PAGE_DELAY_MS = 100;   // Delay giua moi trang
+const MAX_RETRIES = 2;       // Retry toi da khi loi
+const START_PAGE = 236;      // Resume tu trang nay (da crawl xong 1-235)
+const CONCURRENCY = 8;       // So phim xu ly song song
 
 // ── Helpers ──
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
 async function fetchWithRetry(url: string, retries = MAX_RETRIES): Promise<any> {
     for (let i = 0; i < retries; i++) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 15000);
         try {
-            const res = await fetch(url);
+            const res = await fetch(url, { signal: controller.signal });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            return await res.json();
+            const data = await res.json();
+            clearTimeout(timeoutId);
+            return data;
         } catch (err: any) {
+            clearTimeout(timeoutId);
+            if (err.name === 'AbortError') err.message = 'Fetch Timeout';
             if (i < retries - 1) {
-                await sleep(1000 * (i + 1)); // Backoff: 1s, 2s, 3s
+                await sleep(1000 * (i + 1));
                 continue;
             }
             throw err;
@@ -38,96 +44,145 @@ async function fetchWithRetry(url: string, retries = MAX_RETRIES): Promise<any> 
     }
 }
 
-// ── Upsert 1 phim + episodes ──
-async function upsertMovie(movieData: any, episodes: any[], tmdbImages: any = null) {
-    const posterUrl = movieData.poster_url?.startsWith('http') ? movieData.poster_url : `${CDN}${movieData.poster_url}`;
-    const thumbUrl = movieData.thumb_url?.startsWith('http') ? movieData.thumb_url : `${CDN}${movieData.thumb_url}`;
+// ── Upsert 1 phim + episodes (optimized) ──
+async function upsertMovie(movieData: any, episodes: any[]) {
+    const posterUrl = movieData.poster_url?.startsWith('http')
+        ? movieData.poster_url
+        : `${CDN}${movieData.poster_url}`;
+    const thumbUrl = movieData.thumb_url?.startsWith('http')
+        ? movieData.thumb_url
+        : `${CDN}${movieData.thumb_url}`;
 
-    const movieFields = {
-        name: movieData.name,
-        originName: movieData.origin_name,
+    const movieType = movieData.type === 'single' ? 'single' : 'series';
+
+    // 1 round-trip: raw SQL UPSERT thay vi findUnique + create/update (2 round-trips)
+    await prisma.$executeRawUnsafe(`
+        INSERT INTO movies (
+            id, ophim_id, slug, name, origin_name, type,
+            poster_url, thumb_url, description, status, year,
+            categories, countries, actors, directors,
+            time, quality, lang, episode_current, episode_total,
+            tmdb_vote, imdb_vote, imdb_vote_count, view,
+            synced_at, created_at
+        ) VALUES (
+            gen_random_uuid(), $1, $2, $3, $4, $5::"MovieType",
+            $6, $7, $8, $9, $10,
+            $11::jsonb, $12::jsonb, $13::jsonb, $14::jsonb,
+            $15, $16, $17, $18, $19,
+            $20, $21, $22, $23,
+            now(), now()
+        )
+        ON CONFLICT (slug) DO UPDATE SET
+            name = EXCLUDED.name,
+            origin_name = EXCLUDED.origin_name,
+            poster_url = EXCLUDED.poster_url,
+            thumb_url = EXCLUDED.thumb_url,
+            description = EXCLUDED.description,
+            status = EXCLUDED.status,
+            year = EXCLUDED.year,
+            categories = EXCLUDED.categories,
+            countries = EXCLUDED.countries,
+            actors = EXCLUDED.actors,
+            directors = EXCLUDED.directors,
+            time = EXCLUDED.time,
+            quality = EXCLUDED.quality,
+            lang = EXCLUDED.lang,
+            episode_current = EXCLUDED.episode_current,
+            episode_total = EXCLUDED.episode_total,
+            tmdb_vote = EXCLUDED.tmdb_vote,
+            imdb_vote = EXCLUDED.imdb_vote,
+            imdb_vote_count = EXCLUDED.imdb_vote_count,
+            view = EXCLUDED.view,
+            synced_at = now()
+    `,
+        String(movieData._id),
+        movieData.slug,
+        movieData.name,
+        movieData.origin_name || null,
+        movieType,
         posterUrl,
         thumbUrl,
-        description: movieData.content,
-        status: movieData.status,
-        year: movieData.year,
-        categories: movieData.category?.map((c: any) => c.name) ?? [],
-        countries: movieData.country?.map((c: any) => c.name) ?? [],
-        actors: movieData.actor ?? [],
-        directors: movieData.director ?? [],
-        time: movieData.time || null,
-        quality: movieData.quality || null,
-        lang: movieData.lang || null,
-        episodeCurrent: movieData.episode_current || null,
-        episodeTotal: movieData.episode_total || null,
-        tmdbVote: movieData.tmdb?.vote_average || null,
-        imdbVote: movieData.imdb?.vote_average || null,
-        imdbVoteCount: movieData.imdb?.vote_count || 0,
-        view: movieData.view || 0,
-        tmdbPoster: tmdbImages?.poster?.original || tmdbImages?.poster || null,
-        tmdbBackdrop: tmdbImages?.backdrop?.original || tmdbImages?.backdrop || tmdbImages?.backdrops?.[0]?.file_path || null,
-        syncedAt: new Date(),
-    };
+        movieData.content || null,
+        movieData.status || null,
+        movieData.year || null,
+        JSON.stringify(movieData.category?.map((c: any) => c.name) ?? []),
+        JSON.stringify(movieData.country?.map((c: any) => c.name) ?? []),
+        JSON.stringify(movieData.actor ?? []),
+        JSON.stringify(movieData.director ?? []),
+        movieData.time || null,
+        movieData.quality || null,
+        movieData.lang || null,
+        movieData.episode_current || null,
+        movieData.episode_total || null,
+        movieData.tmdb?.vote_average || null,
+        movieData.imdb?.vote_average || null,
+        movieData.imdb?.vote_count || 0,
+        movieData.view || 0,
+    );
 
-    const savedMovie = await prisma.movie.upsert({
-        where: { slug: movieData.slug },
-        update: movieFields,
-        create: {
-            ophimId: movieData._id,
-            slug: movieData.slug,
-            type: movieData.type === 'single' ? 'single' : 'series',
-            ...movieFields,
-        },
-    });
+    // Lay movie id
+    const rows: any[] = await prisma.$queryRawUnsafe(
+        'SELECT id FROM movies WHERE slug = $1', movieData.slug
+    );
+    const movieId = rows[0]?.id;
+    if (!movieId) return;
 
-    // Upsert episodes
+    // Gom tat ca episodes & Loc trung (Dung Set de tranh loi 23505)
+    const allEps: any[] = [];
+    const seen = new Set();
     for (const server of episodes) {
         for (const ep of server.server_data ?? []) {
-            try {
-                await prisma.episode.upsert({
-                    where: {
-                        movieId_serverName_episodeName: {
-                            movieId: savedMovie.id,
-                            serverName: server.server_name,
-                            episodeName: ep.name,
-                        },
-                    },
-                    update: {
-                        linkM3u8: ep.link_m3u8,
-                        linkEmbed: ep.link_embed,
-                    },
-                    create: {
-                        movieId: savedMovie.id,
-                        serverName: server.server_name,
-                        episodeName: ep.name,
-                        linkM3u8: ep.link_m3u8,
-                        linkEmbed: ep.link_embed,
-                    },
-                });
-            } catch { /* Skip duplicate episode errors */ }
+            if (!ep.name) continue;
+            const key = `${server.server_name}-${ep.name}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+
+            allEps.push({
+                serverName: server.server_name || '',
+                episodeName: ep.name,
+                linkM3u8: ep.link_m3u8 || null,
+                linkEmbed: ep.link_embed || null,
+            });
         }
+    }
+
+    if (allEps.length > 0) {
+        // 2 round-trips thay vi N*2: xoa cu roi bulk insert moi
+        await prisma.$executeRawUnsafe('DELETE FROM episodes WHERE movie_id = $1::uuid', movieId);
+
+        const valuePlaceholders = allEps.map((_, i) => {
+            const b = i * 5;
+            return `(gen_random_uuid(), $${b + 1}::uuid, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, now())`;
+        }).join(', ');
+
+        const params: any[] = [];
+        for (const ep of allEps) {
+            params.push(movieId, ep.serverName, ep.episodeName, ep.linkM3u8, ep.linkEmbed);
+        }
+
+        await prisma.$executeRawUnsafe(
+            `INSERT INTO episodes (id, movie_id, server_name, episode_name, link_m3u8, link_embed, created_at) VALUES ${valuePlaceholders}`,
+            ...params
+        );
     }
 }
 
 // ── Main crawl loop ──
 async function main() {
     console.log('');
-    console.log('╔════════════════════════════════════════════╗');
-    console.log('║   🎬 CRAWL TOÀN BỘ PHIM TỪ OPHIM API     ║');
-    console.log('╚════════════════════════════════════════════╝');
+    console.log('=== CRAWL OPHIM => SUPABASE (Optimized) ===');
     console.log('');
 
-    // Lấy tổng số trang từ trang đầu
     const firstPage = await fetchWithRetry(`${OPHIM_API}/v1/api/danh-sach/phim-moi-cap-nhat?page=1`);
     const pagination = firstPage?.data?.params?.pagination ?? {};
     const totalItems = pagination.totalItems ?? 0;
     const perPage = pagination.totalItemsPerPage ?? 24;
     const totalPages = Math.ceil(totalItems / perPage);
 
-    console.log(`📊 Tổng phim: ${totalItems.toLocaleString()}`);
-    console.log(`📄 Tổng trang: ${totalPages.toLocaleString()} (${perPage} phim/trang)`);
-    console.log(`⏱  Delay: ${DELAY_MS}ms/phim, ${PAGE_DELAY_MS}ms/trang`);
-    console.log(`🚀 Bắt đầu từ trang: ${START_PAGE}`);
+    console.log(`Tong phim: ${totalItems.toLocaleString()}`);
+    console.log(`Tong trang: ${totalPages} (${perPage} phim/trang)`);
+    console.log(`Bat dau tu trang: ${START_PAGE}`);
+    console.log(`Xu ly song song: ${CONCURRENCY} phim/batch`);
     console.log('─'.repeat(50));
     console.log('');
 
@@ -140,50 +195,49 @@ async function main() {
         const pageStart = Date.now();
 
         try {
-            // Fetch danh sách phim trang này
             const data = await fetchWithRetry(`${OPHIM_API}/v1/api/danh-sach/phim-moi-cap-nhat?page=${page}`);
             const movies = data?.data?.items ?? [];
 
             if (movies.length === 0) {
-                console.log(`⚠  Trang ${page}: trống → dừng!`);
+                console.log(`Trang ${page}: trong -> dung!`);
                 break;
             }
 
             let pageSynced = 0;
             let pageErrors = 0;
 
-            for (let i = 0; i < movies.length; i++) {
-                const movie = movies[i];
-                try {
-                    // Lấy chi tiết phim
-                    const detail = await fetchWithRetry(`${OPHIM_API}/v1/api/phim/${movie.slug}`);
-                    const movieData = detail?.data?.item;
-                    const episodes = movieData?.episodes ?? [];
+            // Xu ly song song theo batch CONCURRENCY phim
+            for (let i = 0; i < movies.length; i += CONCURRENCY) {
+                const batch = movies.slice(i, i + CONCURRENCY);
+                const results = await Promise.allSettled(
+                    batch.map(async (movie: any) => {
+                        try {
+                            const detail = await fetchWithRetry(`${OPHIM_API}/v1/api/phim/${movie.slug}`);
+                            const movieData = detail?.data?.item;
+                            if (!movieData) return { status: 'skipped', slug: movie.slug };
+                            const eps = movieData?.episodes ?? [];
+                            await upsertMovie(movieData, eps);
+                            return { status: 'ok', slug: movie.slug };
+                        } catch (err: any) {
+                            err.movieSlug = movie.slug;
+                            throw err;
+                        }
+                    })
+                );
 
-                    if (!movieData) {
-                        totalSkipped++;
-                        continue;
+                for (const r of results) {
+                    if (r.status === 'fulfilled') {
+                        if (r.value.status === 'skipped') totalSkipped++;
+                        else { pageSynced++; totalSynced++; }
+                    } else {
+                        pageErrors++;
+                        totalErrors++;
+                        const slug = (r as any).reason?.movieSlug || 'unknown';
+                        const msg = (r as any).reason?.message?.substring(0, 100);
+                        console.error(`  [Loi Phim: ${slug}] ${msg}`);
                     }
-
-                    // Thử lấy ảnh gốc từ TMDB
-                    let tmdbImages = null;
-                    try {
-                        const imgRes = await fetchWithRetry(`${OPHIM_API}/v1/api/phim/${movie.slug}/images`, 1);
-                        tmdbImages = imgRes?.data;
-                    } catch (e) {
-                        // Bỏ qua nếu không lấy được ảnh
-                    }
-
-                    await upsertMovie(movieData, episodes, tmdbImages);
-                    pageSynced++;
-                    totalSynced++;
-
-                    await sleep(DELAY_MS);
-                } catch (err: any) {
-                    pageErrors++;
-                    totalErrors++;
-                    // Không log từng lỗi chi tiết để tránh spam
                 }
+                await sleep(DELAY_MS);
             }
 
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
@@ -193,18 +247,16 @@ async function main() {
                 : '?';
 
             console.log(
-                `📄 Trang ${String(page).padStart(4)}/${totalPages} | ` +
-                `✅ ${pageSynced}/${movies.length} | ` +
-                `Tổng: ${totalSynced.toLocaleString()} | ` +
-                `❌ ${totalErrors} | ` +
-                `⏱ ${pageTime}s | ` +
-                `Đã chạy: ${elapsed}s | ` +
-                `ETA: ~${eta} phút`
+                `[Trang ${String(page).padStart(4)}/${totalPages}] ` +
+                `OK:${pageSynced}/${movies.length} | ` +
+                `Tong:${totalSynced} | ` +
+                `Loi:${totalErrors} | ` +
+                `${pageTime}s | ETA:~${eta}phut`
             );
 
             await sleep(PAGE_DELAY_MS);
         } catch (err: any) {
-            console.error(`❌ Lỗi trang ${page}: ${err.message}. Tiếp tục...`);
+            console.error(`Loi trang ${page}: ${err.message}. Tiep tuc...`);
             totalErrors++;
             await sleep(2000);
         }
@@ -212,17 +264,26 @@ async function main() {
 
     const totalTime = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
     console.log('');
-    console.log('═'.repeat(50));
-    console.log(`✅ HOÀN TẤT!`);
-    console.log(`   Tổng phim đồng bộ: ${totalSynced.toLocaleString()}`);
-    console.log(`   Bỏ qua:           ${totalSkipped}`);
-    console.log(`   Lỗi:              ${totalErrors}`);
-    console.log(`   Thời gian:        ${totalTime} phút`);
-    console.log('═'.repeat(50));
+    console.log('='.repeat(50));
+    console.log(`HOAN TAT!`);
+    console.log(`  Tong phim dong bo: ${totalSynced.toLocaleString()}`);
+    console.log(`  Bo qua:           ${totalSkipped}`);
+    console.log(`  Loi:              ${totalErrors}`);
+    console.log(`  Thoi gian:        ${totalTime} phut`);
+    console.log('='.repeat(50));
 }
 
+process.on('unhandledRejection', (reason) => {
+    console.error('[FATAL unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('[FATAL uncaughtException]', err.message);
+});
+
 main()
-    .catch(console.error)
+    .catch((err) => {
+        console.error('[FATAL main error]', err.message);
+    })
     .finally(() => {
         prisma.$disconnect();
         process.exit(0);
