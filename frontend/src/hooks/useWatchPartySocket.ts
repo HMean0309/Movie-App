@@ -43,6 +43,7 @@ export function useWatchPartySocket(roomId: string | null, handlers: Handlers) {
 
         const socket = io(SOCKET_URL, {
             auth: { token: accessToken },
+            transports: ['websocket'], // Ép sử dụng WebSocket để giảm độ trễ
         });
 
         socketRef.current = socket;

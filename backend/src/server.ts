@@ -23,6 +23,7 @@ const io = new Server(httpServer, {
     origin: allowedOrigins,
     credentials: true,
   },
+  transports: ['websocket'], // Ép sử dụng websocket để giảm độ trễ polling
 });
 
 app.set('io', io);

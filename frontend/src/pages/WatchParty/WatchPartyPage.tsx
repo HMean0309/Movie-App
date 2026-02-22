@@ -160,7 +160,11 @@ function PartyRoom({ room: initialRoom, isHost }: { room: RoomInfo; isHost: bool
     const video = videoRef.current;
     if (!video) return;
     skipSyncRef.current = true;
-    if (Math.abs(video.currentTime - state.currentTime) > 1.5) video.currentTime = state.currentTime;
+
+    // Giảm ngưỡng sai số từ 1.5s xuống 0.5s để đồng bộ chặt chẽ hơn
+    if (Math.abs(video.currentTime - state.currentTime) > 0.5) {
+      video.currentTime = state.currentTime;
+    }
 
     // Nếu host PLAY mà video đang PAUSED → play (có xử lý lỗi autoplay)
     if (state.isPlaying && video.paused) {

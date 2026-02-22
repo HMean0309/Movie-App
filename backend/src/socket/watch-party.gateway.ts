@@ -105,36 +105,39 @@ export function initWatchPartySocket(
       // Fix 2: Chỉ host mới được control
       if (!(await isHost(roomId, socket.data.userId))) return;
 
-      await updateRoomState(roomId, { currentTime, isPlaying: true });
+      // Tối ưu: Phát sóng ngay lập tức trước khi đợi DB update
       io.to(roomId).emit('room:state', {
         currentTime,
         isPlaying: true,
         updatedBy: socket.data.userId,
       });
+      await updateRoomState(roomId, { currentTime, isPlaying: true });
     });
 
     // ── Pause ───────────────────────────────────────────────
     socket.on('room:pause', async ({ roomId, currentTime }) => {
       if (!(await isHost(roomId, socket.data.userId))) return;
 
-      await updateRoomState(roomId, { currentTime, isPlaying: false });
+      // Tối ưu: Phát sóng ngay lập tức
       io.to(roomId).emit('room:state', {
         currentTime,
         isPlaying: false,
         updatedBy: socket.data.userId,
       });
+      await updateRoomState(roomId, { currentTime, isPlaying: false });
     });
 
     // ── Seek ────────────────────────────────────────────────
     socket.on('room:seek', async ({ roomId, currentTime }) => {
       if (!(await isHost(roomId, socket.data.userId))) return;
 
-      await updateRoomState(roomId, { currentTime });
+      // Tối ưu: Phát sóng ngay lập tức
       io.to(roomId).emit('room:state', {
         currentTime,
         isPlaying: true,
         updatedBy: socket.data.userId,
       });
+      await updateRoomState(roomId, { currentTime });
     });
 
     // ── Đổi tập ─────────────────────────────────────────────
