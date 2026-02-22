@@ -22,7 +22,8 @@ export default function SyncPage() {
 
     useEffect(() => {
         if (!accessToken) return;
-        const eventSource = new EventSource(`http://localhost:3001/api/admin/sync/stream?token=${accessToken}`);
+        const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
+        const eventSource = new EventSource(`${API_URL}/admin/sync/stream?token=${accessToken}`);
 
         eventSource.onmessage = (event) => {
             try {
