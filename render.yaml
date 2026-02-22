@@ -2,6 +2,7 @@ services:
   - type: web
     name: streamx-backend
     env: node
+    plan: free
     rootDir: backend
     buildCommand: npm install && npx prisma generate && npm run build
     startCommand: npm run db:push && npm run start
