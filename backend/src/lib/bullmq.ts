@@ -1,6 +1,4 @@
 import { ConnectionOptions } from "bullmq";
+import redis from "./redis"; // Use the existing ioredis instance
 
-export const redisConnection: ConnectionOptions = {
-    host: process.env.REDIS_HOST || 'localhost',
-    port: Number(process.env.REDIS_PORT) || 6379,
-};
+export const redisConnection: any = redis;
